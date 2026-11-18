@@ -1,0 +1,1411 @@
+<script>
+/**
+ * Frontend controller for the Student Budget GAS web app.
+ * Communicates with the Apps Script backend via google.script.run.
+ */
+
+var ReportPdf = {
+
+  money: function(n) {
+    var v = Number(n);
+    if (isNaN(v)) v = 0;
+    return 'Rs. ' + v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  },
+
+  compact: function(v) {
+    var a = Math.abs(v), s;
+    if (a >= 1000000) s = (a / 1000000).toFixed(1).replace(/\.0$/, '') + 'M';
+    else if (a >= 1000) s = (a / 1000).toFixed(1).replace(/\.0$/, '') + 'k';
+    else s = String(Math.round(a));
+    return (v < 0 ? '-' : '') + s;
+  },
+
+  parseDay: function(s) {
+    var m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(s || ''));
+    return m ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])) : null;
+  },
+
+  fmtDate: function(s) {
+    var d = this.parseDay(s);
+    return d ? d.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }) : '';
+  },
+
+  fmtShort: function(s) {
+    var d = this.parseDay(s);
+    return d ? d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '';
+  },
+
+  clean: function(t) {
+    return String(t == null ? '' : t).replace(/[^\x20-\x7E\u00A0-\u00FF]/g, '').trim();
+  },
+
+  balanceSeries: function(data) {
+    var byDay = {};
+    function add(date, delta) { if (date) byDay[date] = (byDay[date] || 0) + delta; }
+    (data.income || []).forEach(function(i) { add(i.date, Number(i.amount) || 0); });
+    (data.expenses || []).forEach(function(e) { add(e.date, -(Number(e.amount) || 0)); });
+    var running = 0;
+    return Object.keys(byDay).sort().map(function(d) {
+      running += byDay[d];
+      return { date: d, balance: Math.round(running * 100) / 100 };
+    });
+  },
+
+  drawChart: function(points) {
+    if (!points.length) return null;
+    var self = this;
+    var W = 1200, H = 480, L = 120, R = 50, T = 50, B = 80;
+    var plotW = W - L - R, plotH = H - T - B;
+    var canvas = document.createElement('canvas');
+    canvas.width = W;
+    canvas.height = H;
+    var ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, W, H);
+
+    var vals = points.map(function(p) { return p.balance; });
+    var lo = Math.min(0, Math.min.apply(null, vals));
+    var hi = Math.max(0, Math.max.apply(null, vals));
+    if (hi === lo) hi = lo + 1000;
+    var rawStep = (hi - lo) / 5;
+    var mag = Math.pow(10, Math.floor(Math.log(rawStep) / Math.LN10));
+    var norm = rawStep / mag;
+    var step = (norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 5 ? 5 : 10) * mag;
+    var yMin = Math.floor(lo / step) * step;
+    var yMax = Math.ceil(hi / step) * step;
+
+    var times = points.map(function(p) { return self.parseDay(p.date).getTime(); });
+    var t0 = Math.min.apply(null, times), t1 = Math.max.apply(null, times);
+    function xAt(i) { return t1 === t0 ? L + plotW / 2 : L + ((times[i] - t0) / (t1 - t0)) * plotW; }
+    function yAt(v) { return T + plotH - ((v - yMin) / (yMax - yMin)) * plotH; }
+
+    ctx.font = '22px Helvetica, Arial, sans-serif';
+    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'right';
+    for (var v = yMin; v <= yMax + step / 2; v += step) {
+      var gy = yAt(v);
+      ctx.strokeStyle = v === 0 ? '#9aa0a6' : '#e8eaed';
+      ctx.lineWidth = v === 0 ? 2 : 1;
+      ctx.beginPath(); ctx.moveTo(L, gy); ctx.lineTo(W - R, gy); ctx.stroke();
+      ctx.fillStyle = '#5f6368';
+      ctx.fillText('Rs. ' + self.compact(v), L - 14, gy);
+    }
+
+    var zeroY = yAt(0);
+    if (points.length > 1) {
+      var grad = ctx.createLinearGradient(0, T, 0, T + plotH);
+      grad.addColorStop(0, 'rgba(15,23,42,0.18)');
+      grad.addColorStop(1, 'rgba(15,23,42,0.01)');
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.moveTo(xAt(0), zeroY);
+      points.forEach(function(p, i) { ctx.lineTo(xAt(i), yAt(p.balance)); });
+      ctx.lineTo(xAt(points.length - 1), zeroY);
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    ctx.strokeStyle = '#0f172a';
+    ctx.lineWidth = 4;
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    points.forEach(function(p, i) {
+      if (i === 0) ctx.moveTo(xAt(i), yAt(p.balance));
+      else ctx.lineTo(xAt(i), yAt(p.balance));
+    });
+    ctx.stroke();
+
+    points.forEach(function(p, i) {
+      ctx.fillStyle = '#ffffff';
+      ctx.strokeStyle = '#0f172a';
+      ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.arc(xAt(i), yAt(p.balance), 6, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    });
+
+    var last = points[points.length - 1];
+    var lx = xAt(points.length - 1), ly = yAt(last.balance);
+    ctx.font = 'bold 24px Helvetica, Arial, sans-serif';
+    ctx.fillStyle = '#0f172a';
+    ctx.textAlign = lx > W - R - 160 ? 'right' : 'center';
+    ctx.textBaseline = 'bottom';
+    ctx.fillText(self.money(last.balance), lx, ly - 16);
+
+    ctx.font = '22px Helvetica, Arial, sans-serif';
+    ctx.fillStyle = '#64748b';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+    var idxs = [];
+    if (points.length <= 7) {
+      for (var k = 0; k < points.length; k++) idxs.push(k);
+    } else {
+      for (var j = 0; j < 7; j++) idxs.push(Math.round((j * (points.length - 1)) / 6));
+    }
+    var lastX = -1000;
+    idxs.forEach(function(i) {
+      var px = xAt(i);
+      if (px - lastX < 120) return;
+      ctx.fillText(self.fmtShort(points[i].date), px, T + plotH + 18);
+      lastX = px;
+    });
+
+    return canvas.toDataURL('image/png');
+  },
+
+  build: function(data) {
+    var self = this;
+    var jsPDF = window.jspdf.jsPDF;
+    var doc = new jsPDF({ unit: 'mm', format: 'a4' });
+    var pageW = doc.internal.pageSize.getWidth();
+    var pageH = doc.internal.pageSize.getHeight();
+    var M = 14, contentW = pageW - M * 2;
+    var BLUE = [15, 23, 42], DARK = [15, 23, 42], GREY = [100, 116, 139];
+    var LIGHT = [248, 250, 252], LINE = [226, 232, 240];
+    var GREEN = [5, 150, 105], AMBER = [217, 119, 6], RED = [225, 29, 72];
+    var s = data.summary || {};
+    var y = 0;
+
+    function ensure(h) {
+      if (y + h > pageH - 18) { doc.addPage(); y = M; }
+    }
+    function heading(text, need) {
+      ensure(need || 30);
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(12);
+      doc.setTextColor.apply(doc, DARK);
+      doc.text(text, M, y);
+      doc.setDrawColor.apply(doc, BLUE);
+      doc.setLineWidth(0.7);
+      doc.line(M, y + 2, M + 14, y + 2);
+      y += 8;
+    }
+    function head(labels, rightFrom) {
+      return [labels.map(function(l, i) {
+        return { content: l, styles: { halign: (rightFrom !== undefined && i >= rightFrom) ? 'right' : 'left' } };
+      })];
+    }
+    function table(title, headRow, rows, footRow, colStyles) {
+      heading(title, rows.length ? 40 : 24);
+      if (!rows.length) {
+        doc.setFont('helvetica', 'italic');
+        doc.setFontSize(9);
+        doc.setTextColor.apply(doc, GREY);
+        doc.text('No records.', M, y);
+        y += 10;
+        return;
+      }
+      doc.autoTable({
+        startY: y,
+        head: headRow,
+        body: rows,
+        foot: footRow || undefined,
+        theme: 'striped',
+        headStyles: { fillColor: BLUE, textColor: 255, fontSize: 9 },
+        footStyles: { fillColor: [241, 245, 249], textColor: DARK, fontStyle: 'bold', fontSize: 9 },
+        styles: { fontSize: 9, cellPadding: 2, textColor: DARK },
+        columnStyles: colStyles || {},
+        showFoot: 'lastPage',
+        margin: { left: M, right: M, bottom: 18 }
+      });
+      y = doc.lastAutoTable.finalY + 9;
+    }
+    function sum(list) {
+      return list.reduce(function(t, r) { return t + (Number(r.amount) || 0); }, 0);
+    }
+    function newestFirst(list) {
+      return (list || []).slice().sort(function(a, b) { return a.date < b.date ? 1 : (a.date > b.date ? -1 : 0); });
+    }
+    function right(text) { return { content: text, styles: { halign: 'right' } }; }
+
+    doc.setFillColor.apply(doc, BLUE);
+    doc.rect(0, 0, pageW, 32, 'F');
+    doc.setTextColor(255, 255, 255);
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(18);
+    doc.text('Student Budget Report', M, 15);
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(9);
+    doc.text('Deterministic Safe-to-Spend & Irregular Cashflow Ledger', M, 22);
+    doc.text('Generated ' + self.clean(data.generatedAt) + '   |   ' + self.clean(data.userEmail), M, 27);
+    y = 42;
+
+    var kpis = [
+      { label: 'Current Balance', value: self.money(s.balance), color: Number(s.balance) < 0 ? RED : DARK },
+      { label: 'Safe to Spend', value: self.money(s.safeToSpend), color: GREEN },
+      { label: 'Total Income', value: self.money(s.totalIncome), color: GREEN },
+      { label: 'Total Expenses', value: self.money(s.totalExpenses), color: RED }
+    ];
+    var gap = 4, boxW = (contentW - gap * 3) / 4, boxH = 20;
+    kpis.forEach(function(k, i) {
+      var x = M + i * (boxW + gap);
+      doc.setFillColor.apply(doc, LIGHT);
+      doc.setDrawColor.apply(doc, LINE);
+      doc.setLineWidth(0.3);
+      doc.roundedRect(x, y, boxW, boxH, 2, 2, 'FD');
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(7);
+      doc.setTextColor.apply(doc, GREY);
+      doc.text(k.label.toUpperCase(), x + 3, y + 6);
+      var fs = 12;
+      doc.setFontSize(fs);
+      while (doc.getTextWidth(k.value) > boxW - 6 && fs > 7) { fs -= 0.5; doc.setFontSize(fs); }
+      doc.setTextColor.apply(doc, k.color);
+      doc.text(k.value, x + 3, y + 14.5);
+    });
+    y += boxH + 9;
+
+    heading('Key Figures', 50);
+    var nextIncome = (s.nextIncomeAmount !== null && s.nextIncomeAmount !== undefined)
+      ? self.money(s.nextIncomeAmount) + ' on ' + self.fmtDate(s.nextIncomeDate)
+      : 'None recorded';
+    var daily = 'Not available (no expected income recorded)';
+    if (s.dailySafeToSpend !== null && s.dailySafeToSpend !== undefined) {
+      var dDays = s.daysUntilNextIncome;
+      if (dDays <= 0) {
+        daily = self.money(s.dailySafeToSpend) + ' available (next income due today)';
+      } else if (dDays === 1) {
+        daily = self.money(s.dailySafeToSpend) + ' available (1 day until next income)';
+      } else {
+        daily = self.money(s.dailySafeToSpend) + ' per day (' + dDays + ' days until next income)';
+      }
+    }
+    var statusText = self.clean(s.statusLabel || 'SAFE');
+    doc.autoTable({
+      startY: y,
+      body: [
+        ['Financial status', statusText],
+        ['Daily safe-to-spend', daily],
+        ['Next expected income', nextIncome],
+        ['Upcoming essential expenses', self.money(s.essentialExpenses)],
+        ['Savings commitment', self.money(s.savingsCommitment)]
+      ],
+      theme: 'grid',
+      styles: { fontSize: 9, cellPadding: 2.5, textColor: DARK, lineColor: LINE, lineWidth: 0.2 },
+      columnStyles: { 0: { fontStyle: 'bold', cellWidth: 62, fillColor: LIGHT } },
+      didParseCell: function(h) {
+        if (h.section === 'body' && h.row.index === 0 && h.column.index === 1) {
+          h.cell.styles.fontStyle = 'bold';
+          h.cell.styles.textColor = statusText === 'SAFE' ? GREEN : (statusText === 'CAUTION' ? AMBER : RED);
+        }
+      },
+      margin: { left: M, right: M, bottom: 18 }
+    });
+    y = doc.lastAutoTable.finalY + 10;
+
+    var series = self.balanceSeries(data);
+    var imgW = contentW, imgH = imgW * 480 / 1200;
+    heading('Balance Over Time', imgH + 22);
+    var img = self.drawChart(series);
+    if (img) {
+      doc.addImage(img, 'PNG', M, y, imgW, imgH);
+      y += imgH + 3;
+      doc.setFont('helvetica', 'italic');
+      doc.setFontSize(8);
+      doc.setTextColor.apply(doc, GREY);
+      doc.text('Running balance after each day that has recorded income or expenses.', M, y);
+      y += 9;
+    } else {
+      doc.setFont('helvetica', 'italic');
+      doc.setFontSize(9);
+      doc.setTextColor.apply(doc, GREY);
+      doc.text('Not enough data yet to draw the chart.', M, y);
+      y += 10;
+    }
+
+    var alerts = s.alerts || [];
+    if (alerts.length) {
+      heading('Alerts', 24);
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(9);
+      alerts.forEach(function(a) {
+        var lines = doc.splitTextToSize(self.clean(a.title + ': ' + a.message), contentW - 6);
+        ensure(lines.length * 4.6 + 2);
+        doc.setFillColor.apply(doc, AMBER);
+        doc.circle(M + 1.2, y - 1, 0.8, 'F');
+        doc.setTextColor.apply(doc, DARK);
+        doc.text(lines, M + 5, y);
+        y += lines.length * 4.6 + 1.5;
+      });
+      y += 6;
+    }
+
+    var cats = data.categories || [];
+    var catTotal = cats.reduce(function(t, c) { return t + (Number(c.amount) || 0); }, 0);
+    table('Spending by Category',
+      head(['Category', 'Amount', 'Share'], 1),
+      cats.map(function(c) {
+        var share = catTotal > 0 ? (c.amount / catTotal) * 100 : 0;
+        return [self.clean(c.category), right(self.money(c.amount)), right(share.toFixed(1) + '%')];
+      }),
+      [['Total', right(self.money(catTotal)), right('100%')]],
+      {});
+
+    var income = newestFirst(data.income);
+    table('Income',
+      head(['Date', 'Source', 'Note', 'Amount'], 3),
+      income.map(function(i) { return [self.fmtDate(i.date), self.clean(i.source), self.clean(i.note), right(self.money(i.amount))]; }),
+      [[{ content: 'Total income', colSpan: 3 }, right(self.money(sum(income)))]],
+      { 0: { cellWidth: 30 }, 1: { cellWidth: 38 }, 3: { cellWidth: 38 } });
+
+    var expenses = newestFirst(data.expenses);
+    table('Expenses',
+      head(['Date', 'Category', 'Note', 'Amount'], 3),
+      expenses.map(function(e) { return [self.fmtDate(e.date), self.clean(e.category), self.clean(e.note), right(self.money(e.amount))]; }),
+      [[{ content: 'Total expenses', colSpan: 3 }, right(self.money(sum(expenses)))]],
+      { 0: { cellWidth: 30 }, 1: { cellWidth: 38 }, 3: { cellWidth: 38 } });
+
+    var upcoming = (data.upcoming || []).slice().sort(function(a, b) { return a.date < b.date ? -1 : (a.date > b.date ? 1 : 0); });
+    table('Upcoming Expenses',
+      head(['Due date', 'Item', 'Category', 'Essential', 'Amount'], 4),
+      upcoming.map(function(u) {
+        return [self.fmtDate(u.date), self.clean(u.note) || self.clean(u.category), self.clean(u.category), u.essential ? 'Yes' : 'No', right(self.money(u.amount))];
+      }),
+      [[{ content: 'Total upcoming', colSpan: 4 }, right(self.money(sum(upcoming)))]],
+      { 0: { cellWidth: 28 }, 2: { cellWidth: 30 }, 3: { cellWidth: 20 }, 4: { cellWidth: 36 } });
+
+    var expected = (data.expectedIncome || []).slice().sort(function(a, b) { return a.date < b.date ? -1 : (a.date > b.date ? 1 : 0); });
+    table('Expected Income',
+      head(['Expected date', 'Source', 'Note', 'Amount'], 3),
+      expected.map(function(i) { return [self.fmtDate(i.date), self.clean(i.source), self.clean(i.note), right(self.money(i.amount))]; }),
+      [[{ content: 'Total expected', colSpan: 3 }, right(self.money(sum(expected)))]],
+      { 0: { cellWidth: 30 }, 1: { cellWidth: 38 }, 3: { cellWidth: 38 } });
+
+    var goals = data.goals || [];
+    table('Savings Goals',
+      head(['Goal', 'Saved', 'Target', 'Progress', 'Target date'], 1),
+      goals.map(function(g) {
+        return [self.clean(g.goalName), right(self.money(g.currentAmount)), right(self.money(g.targetAmount)), right(g.progressPercent + '%'), g.targetDate ? self.fmtDate(g.targetDate) : '-'];
+      }),
+      null,
+      { 4: { halign: 'left' } });
+
+    ensure(14);
+    doc.setFont('helvetica', 'italic');
+    doc.setFontSize(8);
+    doc.setTextColor.apply(doc, GREY);
+    doc.text(doc.splitTextToSize('This report provides deterministic budgeting information based on the records entered in the app. It is not professional financial advice.', contentW), M, y);
+
+    var pages = doc.getNumberOfPages();
+    for (var p = 1; p <= pages; p++) {
+      doc.setPage(p);
+      doc.setDrawColor.apply(doc, LINE);
+      doc.setLineWidth(0.3);
+      doc.line(M, pageH - 12, pageW - M, pageH - 12);
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(8);
+      doc.setTextColor.apply(doc, GREY);
+      doc.text('Student Budget — Irregular Cashflow Planner', M, pageH - 7);
+      doc.text('Page ' + p + ' of ' + pages, pageW - M, pageH - 7, { align: 'right' });
+    }
+    return doc;
+  },
+
+  download: function(data) {
+    var doc = this.build(data);
+    var day = String(data.generatedAt || '').slice(0, 10) || 'report';
+    doc.save('Student-Budget-Report-' + day + '.pdf');
+  }
+};
+
+var app = {
+  currentModalType: null,
+  itemToDelete: null,
+  latestDashboard: null,
+  pendingExpenseSave: null,
+  config: null,
+
+  init: function() {
+    this.showLoading();
+    google.script.run
+      .withSuccessHandler(this.onConfigLoaded.bind(this))
+      .withFailureHandler(this.onError.bind(this))
+      .getConfig();
+  },
+
+  onConfigLoaded: function(result) {
+    if (!result.success) { this.onError(result); return; }
+    this.config = result.config;
+    this.populateDropdowns();
+    this.loadDashboard();
+  },
+
+  populateDropdowns: function() {
+    var incomeSource = document.getElementById('incomeSource');
+    var expectedIncomeSource = document.getElementById('expectedIncomeSource');
+    var expenseCategory = document.getElementById('expenseCategory');
+    var upcomingExpenseCategory = document.getElementById('upcomingExpenseCategory');
+
+    this.config.INCOME_SOURCES.forEach(function(source) {
+      var opt = document.createElement('option');
+      opt.value = source; opt.textContent = source;
+      incomeSource.appendChild(opt.cloneNode(true));
+      expectedIncomeSource.appendChild(opt);
+    });
+
+    this.config.EXPENSE_CATEGORIES.forEach(function(cat) {
+      var opt = document.createElement('option');
+      opt.value = cat; opt.textContent = cat;
+      expenseCategory.appendChild(opt.cloneNode(true));
+      upcomingExpenseCategory.appendChild(opt);
+    });
+  },
+
+  loadDashboard: function() {
+    this.showLoading();
+    google.script.run
+      .withSuccessHandler(this.onDashboardLoaded.bind(this))
+      .withFailureHandler(this.onError.bind(this))
+      .getDashboard();
+  },
+
+  onDashboardLoaded: function(result) {
+    this.hideLoading();
+    if (!result.success) { this.onError(result); return; }
+    this.renderDashboard(result.data);
+  },
+
+  renderDashboard: function(data) {
+    this.latestDashboard = data;
+    if (!data.hasData) {
+      document.getElementById('onboardingState').classList.remove('hidden');
+      document.getElementById('dashboardState').classList.add('hidden');
+      return;
+    }
+    document.getElementById('onboardingState').classList.add('hidden');
+    document.getElementById('dashboardState').classList.remove('hidden');
+
+    document.getElementById('currentBalance').textContent = this.formatCurrency(data.balance.balance);
+    document.getElementById('safeToSpend').textContent = this.formatCurrency(data.safeToSpend.safeToSpend);
+
+    var statusEl = document.getElementById('balanceStatus');
+    statusEl.textContent = data.statusLabel;
+    statusEl.className = 'status-indicator status-' + data.financialStatus.toLowerCase();
+
+var dailyEl = document.getElementById('dailySafeToSpend');
+var dailyAmt = data.dailySafeToSpend.dailySafeToSpend;
+var nextInc = data.safeToSpend.nextExpectedIncome;
+
+if (dailyAmt === null || !nextInc) {
+  dailyEl.textContent = 'No expected income';
+} else {
+  var days = data.dailySafeToSpend.daysUntilNextIncome;
+  if (days === undefined) {
+    days = this.dayNumber(nextInc.date) - this.dayNumber(new Date());
+  }
+  if (days <= 0)       dailyEl.textContent = 'Next income due today';
+  else if (days === 1) dailyEl.textContent = '1 day until next income';
+  else                 dailyEl.textContent = this.formatCurrency(dailyAmt) + '/day \u00B7 ' + days + ' days to next income';
+}
+this.renderBreakdown(data);
+    if (data.safeToSpend.nextExpectedIncome) {
+      document.getElementById('nextIncome').textContent = this.formatCurrency(data.safeToSpend.nextExpectedIncome.amount);
+      document.getElementById('nextIncomeDate').textContent = this.formatDate(data.safeToSpend.nextExpectedIncome.date);
+    } else {
+      document.getElementById('nextIncome').textContent = '--';
+      document.getElementById('nextIncomeDate').textContent = 'No expected income logged';
+    }
+
+    this.renderAlerts(data.alerts);
+    this.renderSpendingChart(data.categorySpending);
+    this.renderBalanceChart(data.balanceProjection);
+    this.renderSavingsGoals(data.savingsProgress);
+    this.renderRecentTransactions(data.recentIncome, data.recentExpenses);
+    this.renderUpcomingObligations(data.upcomingObligations);
+    this.renderExpectedIncome(data.expectedIncome);
+  },
+  renderBreakdown: function(data) {
+    var box = document.getElementById('breakdownBox');
+    var rows = document.getElementById('breakdownRows');
+    var st = data.safeToSpend || {};
+    var bal = Number(data.balance && data.balance.balance);
+    var ess = Number(st.essentialExpensesBeforeNextIncome);
+    var sav = Number(st.savingsCommitment);
+    var safe = Number(st.safeToSpend);
+
+    // Safe-to-Spend is floored at 0 by the engine, so compare against the floored value
+    if ([bal, ess, sav, safe].some(isNaN) || Math.abs(Math.max(bal - ess - sav, 0) - safe) > 0.01) {
+      box.classList.add('hidden');
+      return;
+    }
+    var when = st.hasExpectedIncome ? ' due before next income' : ' (no income date set)';
+    rows.innerHTML =
+      '<div class="breakdown-row"><span>Current balance</span><span>' + this.formatCurrency(bal) + '</span></div>' +
+      '<div class="breakdown-row"><span>\u2212 Essential bills' + when + '</span><span>' + this.formatCurrency(ess) + '</span></div>' +
+      '<div class="breakdown-row"><span>\u2212 Savings goals' + when + '</span><span>' + this.formatCurrency(sav) + '</span></div>' +
+      '<div class="breakdown-row total"><span>= Safe to Spend</span><span>' + this.formatCurrency(safe) + '</span></div>';
+    box.classList.remove('hidden');
+  },
+
+  balanceChart: null,
+
+  renderBalanceChart: function(proj) {
+    var canvas = document.getElementById('balanceChart');
+    if (!canvas) return;
+    if (this.balanceChart) { this.balanceChart.destroy(); this.balanceChart = null; }
+    if (!window.Chart) { console.error('Chart.js did not load'); return; }
+    if (!proj || !proj.labels || !proj.labels.length) { console.error('No chart data', proj); return; }
+
+    var self = this;
+    var todayIdx = proj.actual.length - 1;
+    while (todayIdx > 0 && proj.actual[todayIdx] === null) todayIdx--;
+
+    Chart.defaults.font.family = "'Plus Jakarta Sans', sans-serif";
+    this.balanceChart = new Chart(canvas, {
+      type: 'line',
+      data: {
+        labels: proj.labels,
+        datasets: [
+          {
+            label: 'Actual balance',
+            data: proj.actual,
+            borderColor: '#0f172a',
+            backgroundColor: 'rgba(15,23,42,0.07)',
+            fill: true,
+            borderWidth: 3,
+            tension: 0,
+            pointRadius: function(ctx) { return ctx.dataIndex === todayIdx ? 5 : 0; },
+            pointBackgroundColor: '#ffffff',
+            pointBorderColor: '#0f172a',
+            pointBorderWidth: 2,
+            pointHoverRadius: 5
+          },
+          {
+            label: 'Projected balance',
+            data: proj.projected,
+            borderColor: '#2563eb',
+            borderDash: [7, 6],
+            borderWidth: 3,
+            fill: false,
+            tension: 0,
+            pointRadius: 0,
+            pointHoverRadius: 5
+          }
+        ]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            callbacks: {
+              title: function(items) { return ReportPdf.fmtDate(proj.labels[items[0].dataIndex]); },
+              label: function(c) { return c.dataset.label + ': ' + self.formatCurrency(c.parsed.y); }
+            }
+          }
+        },
+        scales: {
+          x: {
+            grid: { display: false },
+            ticks: {
+              maxTicksLimit: 8,
+              maxRotation: 0,
+              callback: function(v) { return ReportPdf.fmtShort(proj.labels[v]); }
+            }
+          },
+          y: {
+            ticks: { callback: function(v) { return 'Rs. ' + ReportPdf.compact(v); } }
+          }
+        }
+      }
+    });
+  },
+
+  formatCurrency: function(amount) {
+    var value = Number(amount);
+    if (isNaN(value)) value = 0;
+    return 'Rs. ' + value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  },
+
+  formatDate: function(dateStr) {
+    if (!dateStr) return '';
+    var d = new Date(dateStr);
+    if (isNaN(d.getTime())) return '';
+    return d.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+  },
+
+  escapeHtml: function(text) {
+    if (!text) return '';
+    var div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+  },
+
+  linkify: function(escapedText) {
+    var pattern = /(?<![@\w\/.-])((?:https?:\/\/)?(?:[a-z0-9-]+\.)+(?:com|lk|net|org|io|co|shop|store|info|biz|app|online|edu|gov)\b(?:\/[^\s<]*)?)/gi;
+    return escapedText.replace(pattern, function(match) {
+      var trailing = (match.match(/[.,;:!?)\]]+$/) || [''])[0];
+      var address = trailing ? match.slice(0, match.length - trailing.length) : match;
+      var href = /^https?:\/\//i.test(address) ? address : 'https://' + address;
+      return '<a href="' + href.replace(/"/g, '&quot;') + '" target="_blank" rel="noopener noreferrer">' + address + '</a>' + trailing;
+    });
+  },
+
+  renderMarkdown: function(text) {
+    if (!text) return '';
+    var escaped = this.escapeHtml(text);
+    var formatted = escaped.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+    formatted = formatted.replace(/(?:^|\n)[-*]\s+(.+)/g, '<br>&bull; $1');
+    formatted = formatted.replace(/\n\n/g, '<br><br>').replace(/\n/g, '<br>');
+    return this.linkify(formatted);
+  },
+
+  renderSources: function(sources) {
+    if (!sources || sources.length === 0) return '';
+    var links = sources.map(function(s) {
+      var url = String(s.url || '');
+      if (!/^https?:\/\//.test(url)) return '';
+      return '<a href="' + url.replace(/"/g, '&quot;') + '" target="_blank" rel="noopener noreferrer">' + this.escapeHtml(s.title || url) + '</a>';
+    }.bind(this)).filter(Boolean);
+    if (links.length === 0) return '';
+    return '<div class="chat-sources"><span class="chat-sources-label">Sources:</span> ' + links.join(' &middot; ') + '</div>';
+  },
+
+  deleteButton: function(type, id) {
+    if (!id) return '';
+    return '<button class="btn-delete" title="Delete record" onclick="app.showDeleteConfirmation(\'' + type + '\', \'' + this.escapeHtml(String(id)) + '\')">Delete</button>';
+  },
+
+  editButton: function(type, id) {
+    if (!id) return '';
+    return '<button class="btn-delete" title="Edit record" onclick="app.editRecord(\'' + type + '\', \'' + this.escapeHtml(String(id)) + '\')">Edit</button>';
+  },
+
+  renderAlerts: function(alerts) {
+    var section = document.getElementById('alertsSection');
+    var list = document.getElementById('alertsList');
+    if (!alerts || alerts.length === 0) { section.classList.add('hidden'); return; }
+    section.classList.remove('hidden');
+    var icons = {
+      danger: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg>',
+      caution: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0zM12 9v4M12 17h.01"/></svg>'
+    };
+    list.innerHTML = alerts.map(function(a) {
+      var type = a.type.toLowerCase();
+      return '<div class="alert alert-' + type + '">' +
+        '<span class="alert-icon">' + (icons[type] || icons.caution) + '</span>' +
+        '<div class="alert-content">' +
+        '<div class="alert-title">' + this.escapeHtml(a.title) + '</div>' +
+        '<div class="alert-message">' + this.escapeHtml(a.message) + '</div>' +
+        '</div></div>';
+    }.bind(this)).join('');
+  },
+
+  renderSpendingChart: function(categories) {
+    var container = document.getElementById('spendingChart');
+    if (!categories || categories.length === 0) {
+      container.innerHTML = '<p class="empty-state">No recorded expenses yet.</p>';
+      return;
+    }
+    var maxAmount = Math.max.apply(null, categories.map(function(c) { return c.amount; }));
+    container.innerHTML = categories.map(function(cat) {
+      var percent = (cat.amount / maxAmount) * 100;
+      var safeClass = this.escapeHtml(cat.category).replace(/\s+/g, '-');
+      return '<div class="category-bar">' +
+        '<span class="category-bar-label">' + this.escapeHtml(cat.category) + '</span>' +
+        '<div class="category-bar-track"><div class="category-bar-fill cat-' + safeClass + '" style="width: ' + percent + '%"></div></div>' +
+        '<span class="category-bar-value">' + this.formatCurrency(cat.amount) + '</span>' +
+        '</div>';
+    }.bind(this)).join('');
+  },
+
+  renderSavingsGoals: function(goals) {
+    var container = document.getElementById('savingsGoalsList');
+    if (!goals || goals.length === 0) {
+      container.innerHTML = '<p class="empty-state">No savings targets created yet.</p>';
+      return;
+    }
+    container.innerHTML = goals.map(function(g) {
+      return '<div class="savings-goal">' +
+        '<div class="savings-goal-header">' +
+        '<span class="savings-goal-name">' + this.escapeHtml(g.goalName) + '</span>' +
+        '<span class="row-right"><span class="savings-goal-percent">' + g.progressPercent + '%</span>' + this.editButton('savingsGoal', g.goalId) + this.deleteButton('savingsGoal', g.goalId) + '</span>' +
+        '</div>' +
+        '<div class="savings-goal-bar"><div class="savings-goal-fill" style="width: ' + g.progressPercent + '%"></div></div>' +
+        '<div class="savings-goal-details">' +
+        '<span>' + this.formatCurrency(g.currentAmount) + ' saved</span>' +
+        '<span>' + this.formatCurrency(g.remainingAmount) + ' remaining</span>' +
+        '</div>' +
+        '<div class="savings-goal-details savings-goal-target">' +
+        '<span>' + (g.targetDate ? 'Target ' + this.formatDate(g.targetDate) : 'No target date set') + '</span>' +
+        '</div></div>';
+    }.bind(this)).join('');
+  },
+
+  renderRecentTransactions: function(income, expenses) {
+    var container = document.getElementById('recentTransactions');
+    if ((!income || income.length === 0) && (!expenses || expenses.length === 0)) {
+      container.innerHTML = '<p class="empty-state">No transactions logged yet.</p>';
+      return;
+    }
+    var all = income.map(function(i) { return { type: 'income', data: i, date: i.date }; })
+      .concat(expenses.map(function(e) { return { type: 'expense', data: e, date: e.date }; }))
+      .sort(function(a, b) { return new Date(b.date) - new Date(a.date); })
+      .slice(0, 10);
+
+    container.innerHTML = all.map(function(item) {
+      var isIncome = item.type === 'income';
+      var title = isIncome ? item.data.source : item.data.category;
+      var meta = this.formatDate(item.date) + (item.data.note ? ' \u2014 ' + item.data.note : '');
+      var delBtn = isIncome ? this.deleteButton('income', item.data.incomeId) : this.deleteButton('expense', item.data.expenseId);
+      var editBtn = isIncome ? this.editButton('income', item.data.incomeId) : this.editButton('expense', item.data.expenseId);
+      return '<div class="transaction">' +
+        '<div class="transaction-info">' +
+        '<div class="transaction-title">' + this.escapeHtml(title) + '</div>' +
+        '<div class="transaction-meta">' + this.escapeHtml(meta) + '</div>' +
+        '</div>' +
+        '<div class="row-right"><div class="transaction-amount ' + (isIncome ? 'income' : 'expense') + '">' + (isIncome ? '+' : '-') + this.formatCurrency(item.data.amount) + '</div>' + editBtn + delBtn + '</div>' +
+        '</div>';
+    }.bind(this)).join('');
+  },
+
+  renderUpcomingObligations: function(obligations) {
+    var container = document.getElementById('upcomingObligations');
+    if (!obligations || obligations.length === 0) {
+      container.innerHTML = '<p class="empty-state">No scheduled obligations.</p>';
+      return;
+    }
+    var todayNum = this.dayNumber(new Date());
+    container.innerHTML = obligations.map(function(ob) {
+      var dueNum = this.dayNumber(ob.date);
+      var isOverdue = dueNum !== null && todayNum !== null && dueNum < todayNum;
+      var daysOverdue = isOverdue ? todayNum - dueNum : 0;
+      var overdueBadge = isOverdue ? ' <span class="obligation-overdue">Overdue</span>' : '';
+      var meta = isOverdue
+        ? 'Was due ' + this.formatDate(ob.date) + ' \u00B7 ' + daysOverdue + ' day' + (daysOverdue === 1 ? '' : 's') + ' ago'
+        : 'Due: ' + this.formatDate(ob.date);
+      return '<div class="obligation">' +
+        '<div class="obligation-info">' +
+        '<div class="obligation-name">' + this.escapeHtml(ob.note || ob.category) + (ob.essential ? ' <span class="obligation-essential">Essential</span>' : '') + overdueBadge + '</div>' +
+        '<div class="obligation-meta' + (isOverdue ? ' is-overdue' : '') + '">' + meta + '</div>' +
+        '</div>' +
+        '<div class="row-right"><div class="obligation-amount">' + this.formatCurrency(ob.amount) + '</div>' + this.editButton('upcomingExpense', ob.expenseId) + this.deleteButton('expense', ob.expenseId) + '</div>' +
+        '</div>';
+    }.bind(this)).join('');
+  },
+
+  dayNumber: function(value) {
+    if (value instanceof Date) {
+      return isNaN(value.getTime()) ? null : Math.round(Date.UTC(value.getFullYear(), value.getMonth(), value.getDate()) / 86400000);
+    }
+    var text = String(value === null || value === undefined ? '' : value).replace(/^\s+|\s+$/g, '');
+    var dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text);
+    if (dateOnly) {
+      return Math.round(Date.UTC(Number(dateOnly[1]), Number(dateOnly[2]) - 1, Number(dateOnly[3])) / 86400000);
+    }
+    var parsed = new Date(text);
+    return isNaN(parsed.getTime()) ? null : Math.round(Date.UTC(parsed.getFullYear(), parsed.getMonth(), parsed.getDate()) / 86400000);
+  },
+
+  renderExpectedIncome: function(items) {
+    var container = document.getElementById('expectedIncomeList');
+    if (!container) return;
+    if (!items || items.length === 0) {
+      container.innerHTML = '<p class="empty-state">No scheduled inflows.</p>';
+      return;
+    }
+    container.innerHTML = items.map(function(i) {
+      var meta = this.formatDate(i.date) + (i.note ? ' \u2014 ' + i.note : '');
+      return '<div class="transaction">' +
+        '<div class="transaction-info">' +
+        '<div class="transaction-title">' + this.escapeHtml(i.source) + '</div>' +
+        '<div class="transaction-meta">Expected: ' + this.escapeHtml(meta) + '</div>' +
+        '</div>' +
+        '<div class="row-right"><div class="transaction-amount income">' + this.formatCurrency(i.amount) + '</div>' + this.editButton('expectedIncome', i.incomeId) + this.deleteButton('expectedIncome', i.incomeId) + '</div>' +
+        '</div>';
+    }.bind(this)).join('');
+  },
+
+  showModal: function(type) {
+    this.currentModalType = type;
+    this.editingRecord = null;
+    var form = document.getElementById('modalForm');
+    form.reset();
+    var submitBtn = document.getElementById('submitBtn');
+    submitBtn.disabled = false;
+    submitBtn.textContent = 'Save Record';
+    var sections = document.querySelectorAll('.form-section');
+    for (var i = 0; i < sections.length; i++) sections[i].classList.add('hidden');
+    var formMap = { income: 'incomeForm', expense: 'expenseForm', expectedIncome: 'expectedIncomeForm', upcomingExpense: 'upcomingExpenseForm', savingsGoal: 'savingsGoalForm' };
+    var titleMap = { income: 'Record Income', expense: 'Record Expense', expectedIncome: 'Schedule Expected Income', upcomingExpense: 'Record Upcoming Bill/Expense', savingsGoal: 'Create Savings Target' };
+    document.getElementById('modalTitle').textContent = titleMap[type];
+    document.getElementById(formMap[type]).classList.remove('hidden');
+    var today = this.getTodayString();
+    var dateInputs = document.querySelectorAll('#modalForm input[type="date"]');
+    for (var i = 0; i < dateInputs.length; i++) { if (!dateInputs[i].value) dateInputs[i].value = today; }
+    document.getElementById('formError').classList.add('hidden');
+    document.getElementById('modalOverlay').classList.remove('hidden');
+  },
+
+  closeModal: function() {
+    document.getElementById('modalOverlay').classList.add('hidden');
+    document.getElementById('modalForm').reset();
+    var submitBtn = document.getElementById('submitBtn');
+    if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = 'Save Record'; }
+    this.currentModalType = null;
+    this.editingRecord = null;
+  },
+
+  closeModalOutside: function(event) {
+    if (event.target === document.getElementById('modalOverlay')) this.closeModal();
+  },
+
+  /** Open the same modal, pre-filled with an existing record. */
+  editRecord: function(type, id) {
+    var record = this.findRecord(type, id);
+    if (!record) {
+      this.showToast('That record is no longer on the dashboard — refreshing', 'error');
+      this.loadDashboard();
+      return;
+    }
+    this.showModal(type);
+    this.editingRecord = { type: type, id: id, record: record };
+    var titleMap = {
+      income: 'Edit Income',
+      expense: 'Edit Expense',
+      expectedIncome: 'Edit Expected Income',
+      upcomingExpense: 'Edit Upcoming Bill/Expense',
+      savingsGoal: 'Edit Savings Target'
+    };
+    document.getElementById('modalTitle').textContent = titleMap[type];
+    document.getElementById('submitBtn').textContent = 'Update Record';
+    this.fillForm(type, record);
+  },
+
+  /** Find the record behind an Edit button in the dashboard data we already have. */
+  findRecord: function(type, id) {
+    var dash = this.latestDashboard || {};
+    var pool;
+    var key;
+    if (type === 'income') { pool = dash.recentIncome || []; key = 'incomeId'; }
+    else if (type === 'expense') { pool = dash.recentExpenses || []; key = 'expenseId'; }
+    else if (type === 'expectedIncome') { pool = dash.expectedIncome || []; key = 'incomeId'; }
+    else if (type === 'upcomingExpense') { pool = dash.upcomingObligations || []; key = 'expenseId'; }
+    else if (type === 'savingsGoal') { pool = dash.savingsProgress || []; key = 'goalId'; }
+    else return null;
+    for (var i = 0; i < pool.length; i++) {
+      if (pool[i] && String(pool[i][key]) === String(id)) return pool[i];
+    }
+    return null;
+  },
+
+  /** Copy an existing record into the visible form fields. */
+  fillForm: function(type, r) {
+    var setV = function (id, value) {
+      var el = document.getElementById(id);
+      if (el) el.value = value === null || value === undefined ? '' : String(value);
+    };
+    var day = function (v) {
+      if (v instanceof Date && !isNaN(v.getTime())) {
+        var m = String(v.getMonth() + 1).padStart(2, '0');
+        var d = String(v.getDate()).padStart(2, '0');
+        return v.getFullYear() + '-' + m + '-' + d;
+      }
+      return String(v || '').slice(0, 10);
+    };
+    switch (type) {
+      case 'income':
+        setV('incomeAmount', r.amount);
+        setV('incomeDate', day(r.date));
+        setV('incomeSource', r.source);
+        setV('incomeNote', r.note);
+        break;
+      case 'expense':
+        setV('expenseAmount', r.amount);
+        setV('expenseDate', day(r.date));
+        setV('expenseCategory', r.category);
+        setV('expenseNote', r.note);
+        break;
+      case 'expectedIncome':
+        setV('expectedIncomeAmount', r.amount);
+        setV('expectedIncomeDate', day(r.date));
+        setV('expectedIncomeSource', r.source);
+        setV('expectedIncomeNote', r.note);
+        break;
+      case 'upcomingExpense':
+        setV('upcomingExpenseName', r.note || r.category);
+        setV('upcomingExpenseAmount', r.amount);
+        setV('upcomingExpenseDate', day(r.date));
+        setV('upcomingExpenseCategory', r.category);
+        setV('upcomingExpenseNote', '');
+        break;
+      case 'savingsGoal':
+        setV('savingsGoalName', r.goalName);
+        setV('savingsGoalTarget', r.targetAmount);
+        setV('savingsGoalCurrent', r.currentAmount || 0);
+        setV('savingsGoalDate', day(r.targetDate));
+        break;
+    }
+  },
+
+  getTodayString: function() {
+    var d = new Date();
+    var month = String(d.getMonth() + 1).padStart(2, '0');
+    var day = String(d.getDate()).padStart(2, '0');
+    return d.getFullYear() + '-' + month + '-' + day;
+  },
+
+  handleFormSubmit: function(event) {
+    event.preventDefault();
+    var type = this.currentModalType;
+    var data = this.collectFormData(type);
+    if (!data) return;
+
+    if (type === 'expense') {
+      // When editing, only the increase counts as new spending.
+      var editing = this.editingRecord;
+      var previous = editing && editing.type === 'expense' ? Number(editing.record.amount) || 0 : 0;
+      var extra = Number(data.amount) - previous;
+      if (extra > 0) {
+        var impact = this.assessExpenseImpact(extra);
+        if (impact) {
+          this.pendingExpenseSave = { type: type, data: data };
+          this.showSpendWarning(impact);
+          return;
+        }
+      }
+    }
+    this.saveFormData(type, data);
+  },
+
+  saveFormData: function(type, data) {
+    var submitBtn = document.getElementById('submitBtn');
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Saving...';
+
+    var editing = this.editingRecord && this.editingRecord.type === type ? this.editingRecord : null;
+    if (editing) {
+      var idField = {
+        income: 'incomeId',
+        expense: 'expenseId',
+        expectedIncome: 'incomeId',
+        upcomingExpense: 'expenseId',
+        savingsGoal: 'goalId'
+      }[type];
+      data[idField] = editing.id;
+    }
+
+    var addMap = {
+      income: 'addIncome',
+      expense: 'addExpense',
+      expectedIncome: 'addExpectedIncome',
+      upcomingExpense: 'addUpcomingExpense',
+      savingsGoal: 'addSavingsGoal'
+    };
+    var updateMap = {
+      income: 'updateIncome',
+      expense: 'updateExpense',
+      expectedIncome: 'updateExpectedIncome',
+      upcomingExpense: 'updateUpcomingExpense',
+      savingsGoal: 'updateSavingsGoal'
+    };
+    var fnName = editing ? updateMap[type] : addMap[type];
+    google.script.run
+      .withSuccessHandler(this.onSaveSuccess.bind(this))
+      .withFailureHandler(this.onSaveFailure.bind(this, submitBtn))
+      [fnName](data);
+  },
+
+  /** Rebuilds the un-floored Safe-to-Spend buffer from the dashboard figures. */
+  assessExpenseImpact: function(amount) {
+    var dash = this.latestDashboard;
+    if (!dash || !dash.safeToSpend) return null;
+    var info = dash.safeToSpend;
+    var toCents = function(value) {
+      var n = Number(value);
+      return isFinite(n) ? Math.round(n * 100) : NaN;
+    };
+    var amountCents = toCents(amount);
+    var balanceCents = toCents(info.currentBalance);
+    var essentialCents = toCents(info.essentialExpensesBeforeNextIncome);
+    var savingsCents = toCents(info.savingsCommitment);
+    if (!isFinite(amountCents) || amountCents <= 0) return null;
+    if (!isFinite(balanceCents) || !isFinite(essentialCents) || !isFinite(savingsCents)) return null;
+
+    var availableCents = balanceCents - essentialCents - savingsCents;
+    var projectedCents = availableCents - amountCents;
+    var level = null;
+    if (availableCents <= 0) level = 'already-below';
+    else if (projectedCents < 0) level = 'crossing';
+    else if (projectedCents === 0) level = 'limit';
+    if (!level) return null;
+
+    return {
+      level: level,
+      available: Math.max(availableCents, 0) / 100,
+      amount: amountCents / 100,
+      projected: Math.max(projectedCents, 0) / 100,
+      shortfall: Math.max(-projectedCents, 0) / 100
+    };
+  },
+
+  showSpendWarning: function(impact) {
+    var title;
+    var text;
+    if (impact.level === 'already-below') {
+      title = "You're already below your Safe-to-Spend";
+      text = 'Your essential bills and savings goals already use up your available cash. Adding this expense dips into money set aside for them.';
+    } else if (impact.level === 'crossing') {
+      title = 'This expense goes over your Safe-to-Spend';
+      text = 'You are ' + this.formatCurrency(impact.shortfall) + ' short of covering it without touching money reserved for essential bills and savings.';
+    } else {
+      title = 'This uses the rest of your Safe-to-Spend';
+      text = "After this expense you'll have nothing left for flexible spending until your next income.";
+    }
+    document.getElementById('spendWarningTitle').textContent = title;
+    document.getElementById('spendWarningText').textContent = text;
+
+    var rows =
+      '<div class="spend-warning-row"><span>Safe to Spend now</span><strong>' + this.formatCurrency(impact.available) + '</strong></div>' +
+      '<div class="spend-warning-row"><span>This expense</span><strong>\u2212 ' + this.formatCurrency(impact.amount) + '</strong></div>' +
+      '<div class="spend-warning-row total"><span>Safe to Spend after</span><strong>' + this.formatCurrency(impact.projected) + '</strong></div>';
+    if (impact.shortfall > 0) {
+      rows += '<div class="spend-warning-row shortfall"><span>Over your buffer by</span><strong>' + this.formatCurrency(impact.shortfall) + '</strong></div>';
+    }
+    document.getElementById('spendWarningRows').innerHTML = rows;
+    document.getElementById('spendWarningModal').classList.remove('hidden');
+  },
+
+  closeSpendWarning: function(confirmed) {
+    document.getElementById('spendWarningModal').classList.add('hidden');
+    var pending = this.pendingExpenseSave;
+    this.pendingExpenseSave = null;
+    if (pending && confirmed) this.saveFormData(pending.type, pending.data);
+  },
+
+  closeSpendWarningOutside: function(event) {
+    if (event.target === document.getElementById('spendWarningModal')) this.closeSpendWarning(false);
+  },
+
+  collectFormData: function(type) {
+    var data = {};
+    var val = function(id) { return document.getElementById(id).value; };
+    switch (type) {
+      case 'income':
+        data.amount = val('incomeAmount');
+        data.date = val('incomeDate');
+        data.source = val('incomeSource');
+        data.note = val('incomeNote');
+        break;
+      case 'expense':
+        data.amount = val('expenseAmount');
+        data.date = val('expenseDate');
+        data.category = val('expenseCategory');
+        data.note = val('expenseNote');
+        break;
+      case 'expectedIncome':
+        data.amount = val('expectedIncomeAmount');
+        data.date = val('expectedIncomeDate');
+        data.source = val('expectedIncomeSource');
+        data.note = val('expectedIncomeNote');
+        break;
+      case 'upcomingExpense':
+        data.name = val('upcomingExpenseName');
+        data.amount = val('upcomingExpenseAmount');
+        data.dueDate = val('upcomingExpenseDate');
+        data.category = val('upcomingExpenseCategory');
+        data.note = val('upcomingExpenseNote');
+        break;
+      case 'savingsGoal':
+        data.goalName = val('savingsGoalName');
+        data.targetAmount = val('savingsGoalTarget');
+        data.currentAmount = val('savingsGoalCurrent') || '0';
+        data.targetDate = val('savingsGoalDate');
+        break;
+    }
+    return data;
+  },
+
+  onSaveSuccess: function(result) {
+    var submitBtn = document.getElementById('submitBtn');
+    var wasEdit = !!this.editingRecord;
+    submitBtn.disabled = false;
+    submitBtn.textContent = wasEdit ? 'Update Record' : 'Save Record';
+    if (!result || !result.success) {
+      this.showFormError(result && result.errors ? result.errors.join(', ') : 'Save failed');
+      return;
+    }
+    this.closeModal();
+    this.showToast(wasEdit ? 'Record updated' : 'Saved to ledger successfully', 'success');
+    this.loadDashboard();
+  },
+
+  onSaveFailure: function(submitBtn, err) {
+    submitBtn.disabled = false;
+    submitBtn.textContent = this.editingRecord ? 'Update Record' : 'Save Record';
+    this.showFormError(err.message || 'Save failed');
+  },
+
+  showFormError: function(message) {
+    var errorEl = document.getElementById('formError');
+    errorEl.textContent = message;
+    errorEl.classList.remove('hidden');
+  },
+
+  showDeleteConfirmation: function(type, id) {
+    this.itemToDelete = { type: type, id: id };
+    var names = { income: 'income entry', expectedIncome: 'expected inflow', expense: 'expense record', savingsGoal: 'savings target' };
+    var name = names[type] || 'record';
+    document.getElementById('deleteTitle').textContent = 'Delete ' + name + '?';
+    document.getElementById('deleteText').textContent = 'Are you sure you want to remove this ' + name + '? This cannot be undone.';
+    document.getElementById('deleteModal').classList.remove('hidden');
+  },
+
+  closeDeleteModal: function() {
+    document.getElementById('deleteModal').classList.add('hidden');
+    this.itemToDelete = null;
+  },
+
+  closeDeleteModalOutside: function(event) {
+    if (event.target === document.getElementById('deleteModal')) this.closeDeleteModal();
+  },
+
+  confirmDelete: function() {
+    if (!this.itemToDelete) return;
+    var btn = document.getElementById('confirmDeleteBtn');
+    btn.disabled = true;
+    btn.textContent = 'Deleting...';
+
+    var fnMap = {
+      income: 'deleteIncome',
+      expectedIncome: 'deleteExpectedIncome',
+      expense: 'deleteExpense',
+      savingsGoal: 'deleteSavingsGoal'
+    };
+    var fnName = fnMap[this.itemToDelete.type];
+    google.script.run
+      .withSuccessHandler(this.onDeleteSuccess.bind(this))
+      .withFailureHandler(this.onDeleteFailure.bind(this, btn))
+      [fnName](this.itemToDelete.id);
+  },
+
+  onDeleteSuccess: function(result) {
+    var btn = document.getElementById('confirmDeleteBtn');
+    btn.disabled = false;
+    btn.textContent = 'Confirm Delete';
+    if (!result.success) { this.showToast('Delete failed', 'error'); return; }
+    this.closeDeleteModal();
+    this.showToast('Record removed successfully', 'success');
+    this.loadDashboard();
+  },
+
+  onDeleteFailure: function(btn, err) {
+    btn.disabled = false;
+    btn.textContent = 'Confirm Delete';
+    this.showToast('Delete failed: ' + err.message, 'error');
+  },
+
+  loadDemoData: function() {
+    var btn = event.target;
+    var origText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Loading...';
+    google.script.run
+      .withSuccessHandler(function(result) {
+        btn.disabled = false;
+        btn.textContent = origText;
+        if (result.success) {
+          this.showToast('Demo profile loaded', 'success');
+          this.loadDashboard();
+        } else {
+          this.showToast('Demo load failed', 'error');
+        }
+      }.bind(this))
+      .withFailureHandler(function(err) {
+        btn.disabled = false;
+        btn.textContent = origText;
+        this.showToast('Demo load failed: ' + err.message, 'error');
+      }.bind(this))
+      .loadDemoData();
+  },
+
+  resetAll: function() {
+    if (!confirm('This will delete ALL your recorded transactions and targets. Are you sure?')) return;
+    google.script.run
+      .withSuccessHandler(function(result) {
+        if (result.success) {
+          this.showToast('All data cleared', 'success');
+          this.loadDashboard();
+        } else {
+          this.showToast('Reset failed', 'error');
+        }
+      }.bind(this))
+      .withFailureHandler(function(err) {
+        this.showToast('Reset failed: ' + err.message, 'error');
+      }.bind(this))
+      .resetAllData();
+  },
+
+  downloadReport: function() {
+    var btn = document.getElementById('pdfBtn');
+    var origText = btn.innerHTML;
+    var reset = function() { btn.disabled = false; btn.innerHTML = origText; };
+    if (!window.jspdf || !window.jspdf.jsPDF || !document.createElement('canvas').getContext) {
+      this.showToast('PDF tools did not load. Please refresh the page and try again.', 'error');
+      return;
+    }
+    btn.disabled = true;
+    btn.textContent = 'Preparing...';
+    google.script.run
+      .withSuccessHandler(function(result) {
+        try {
+          if (!result || !result.success) throw new Error((result && result.error) || 'No data returned');
+          ReportPdf.download(result.data);
+          this.showToast('Report downloaded', 'success');
+        } catch (e) {
+          console.error('PDF error:', e);
+          this.showToast('Could not create the PDF: ' + e.message, 'error');
+        }
+        reset();
+      }.bind(this))
+      .withFailureHandler(function(err) {
+        reset();
+        this.showToast('Could not load report data: ' + (err && err.message ? err.message : 'unknown error'), 'error');
+      }.bind(this))
+      .getReportData();
+  },
+
+  getStarted: function() {
+    document.getElementById('onboardingState').classList.add('hidden');
+    document.getElementById('dashboardState').classList.remove('hidden');
+    this.showModal('income');
+  },
+
+  showLoading: function() {
+    document.getElementById('loadingState').classList.remove('hidden');
+    document.getElementById('onboardingState').classList.add('hidden');
+    document.getElementById('dashboardState').classList.add('hidden');
+  },
+
+  hideLoading: function() {
+    document.getElementById('loadingState').classList.add('hidden');
+  },
+
+  showToast: function(message, type) {
+    var toast = document.getElementById('toast');
+    var toastMessage = document.getElementById('toastMessage');
+    toastMessage.textContent = message;
+    toast.className = 'toast-capsule ' + (type || '');
+    toast.classList.remove('hidden');
+    setTimeout(function() { toast.classList.add('hidden'); }, 3000);
+  },
+
+  fillChatPrompt: function(text) {
+    var input = document.getElementById('chatInput');
+    if (!input) return;
+    input.value = text;
+    input.focus();
+  },
+
+  handleChatKeyDown: function(event) {
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault();
+      this.sendChatMessage();
+    }
+  },
+
+  chatHistory: [],
+
+  sendChatMessage: function() {
+    var input = document.getElementById('chatInput');
+    var sendBtn = document.getElementById('chatSendBtn');
+    var msg = (input && input.value || '').trim();
+    if (!msg) return;
+
+    var chatMessages = document.getElementById('chatMessages');
+
+    chatMessages.insertAdjacentHTML('beforeend', '<div class="chat-msg user"><div class="chat-author">You</div><div class="chat-body-text">' + this.escapeHtml(msg) + '</div></div>');
+    input.value = '';
+
+    var isShopQuery = /\b(buy|shop|store|price|cost|where|daraz|bag|laptop|book|clothes|market|item)\b/i.test(msg);
+    var statusText = isShopQuery 
+      ? 'Searching Sri Lankan shops & comparing Safe-to-Spend...' 
+      : 'Thinking & analyzing your budget ledger...';
+
+    var loadingId = 'loading-' + Date.now();
+    var loadingHtml = 
+      '<div class="chat-msg ai" id="' + loadingId + '">' +
+        '<div class="chat-author">Assistant</div>' +
+        '<div class="chat-body-text" style="display:flex; align-items:center; gap:10px; color:#64748b; font-size:0.84rem; padding:4px 0;">' +
+          '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#0f172a" stroke-width="2.5" style="animation: spin 0.9s linear infinite; flex-shrink: 0;">' +
+            '<circle cx="12" cy="12" r="10" stroke-opacity="0.2"></circle>' +
+            '<path d="M12 2a10 10 0 0 1 10 10" stroke-linecap="round"></path>' +
+          '</svg>' +
+          '<span style="font-weight: 500; letter-spacing: 0.01em;">' + statusText + '</span>' +
+        '</div>' +
+      '</div>';
+    chatMessages.insertAdjacentHTML('beforeend', loadingHtml);
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+
+    if (sendBtn) sendBtn.disabled = true;
+
+    this.chatHistory.push({ role: 'user', content: msg });
+    var history = this.chatHistory.slice(0, -1);
+
+    // Apps Script can take a while (two model calls + a web search). Never leave
+    // the spinner running forever: give up after 90s and explain what happened.
+    var settled = false;
+    var giveUp = setTimeout(function() {
+      if (settled) return;
+      settled = true;
+      if (sendBtn) sendBtn.disabled = false;
+      var stalled = document.getElementById(loadingId);
+      if (stalled) stalled.remove();
+      app.chatHistory.pop();
+      chatMessages.insertAdjacentHTML('beforeend', '<div class="chat-msg ai"><div class="chat-author">Assistant</div><div class="chat-body-text">The AI service took too long to answer. Check Project Settings &rarr; Script properties for GEMINI_API_KEY and TAVILY_API_KEY, then try again.</div></div>');
+      chatMessages.scrollTop = chatMessages.scrollHeight;
+    }, 90000);
+
+    google.script.run
+      .withSuccessHandler(function(result) {
+        settled = true;
+        clearTimeout(giveUp);
+        if (sendBtn) sendBtn.disabled = false;
+        var loaderEl = document.getElementById(loadingId);
+        if (loaderEl) loaderEl.remove();
+
+        var reply = String(result.response || '');
+        this.chatHistory.push({ role: 'model', content: reply });
+        var mentionsSite = /\b[a-z0-9-]+\.(com|lk|net|org|io|co|shop|store)\b/i.test(reply);
+        // The curated store directory already supplies verified URLs, so only
+        // warn when the reply talks about websites and no links were verified.
+        var hasSources = !!(result.sources && result.sources.length);
+        var warning = (!result.searched && !hasSources && mentionsSite)
+          ? '<div class="chat-sources chat-warning">No verified shop links were used for this answer, so please double-check the website before relying on it.</div>'
+          : '';
+
+        chatMessages.insertAdjacentHTML('beforeend', '<div class="chat-msg ai"><div class="chat-author">Assistant</div><div class="chat-body-text">' + this.renderMarkdown(reply) + '</div>' + this.renderSources(result.sources) + warning + '</div>');
+        chatMessages.scrollTop = chatMessages.scrollHeight;
+        var ci = document.getElementById('chatInput');
+        if (ci) { ci.value = ''; ci.focus(); }
+      }.bind(this))
+      .withFailureHandler(function(err) {
+        settled = true;
+        clearTimeout(giveUp);
+        if (sendBtn) sendBtn.disabled = false;
+        var loaderEl = document.getElementById(loadingId);
+        if (loaderEl) loaderEl.remove();
+
+        console.error('Chat error:', err);
+        this.chatHistory.pop();
+        var detail = (err && err.message) ? ' (' + this.escapeHtml(String(err.message)) + ')' : '';
+        chatMessages.insertAdjacentHTML('beforeend', '<div class="chat-msg ai"><div class="chat-author">Assistant</div><div class="chat-body-text">Sorry, could not get a response.' + detail + ' Please try again.</div></div>');
+        chatMessages.scrollTop = chatMessages.scrollHeight;
+      }.bind(this))
+      .chatWithGemini(msg, history);
+  },
+
+  onError: function(err) {
+    this.hideLoading();
+    console.error('App error:', err);
+    this.showToast('Error: ' + (err.message || 'Unknown error'), 'error');
+  }
+};
+document.addEventListener('keydown', function(e) {
+  if (e.key !== 'Escape') return;
+  if (!document.getElementById('spendWarningModal').classList.contains('hidden')) app.closeSpendWarning(false);
+  else if (!document.getElementById('deleteModal').classList.contains('hidden')) app.closeDeleteModal();
+  else if (!document.getElementById('modalOverlay').classList.contains('hidden')) app.closeModal();
+});
+document.addEventListener('DOMContentLoaded', function() { app.init(); });
+</script>
